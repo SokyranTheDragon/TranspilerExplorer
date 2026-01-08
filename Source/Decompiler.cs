@@ -17,6 +17,7 @@ using System.Reflection.Emit;
 using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using System.Threading;
+using MonoMod.Utils.Cil;
 using UnityEngine;
 
 namespace TranspilerExplorer
@@ -74,16 +75,81 @@ namespace TranspilerExplorer
 
         static void WriteAssembly(Stream stream, MethodBase orig, MethodInfo transpiler)
         {
-            var patch = MethodPatcher.CreateDynamicMethod(orig, DummyMethod, false);
+            var patch = MethodPatcherTools.CreateDynamicMethod(orig, DummyMethod, false);
             var il = patch.GetILGenerator();
-            var originalVariables = MethodPatcher.DeclareOriginalLocalVariables(il, orig);
+            var originalVariables = MethodPatcherTools.DeclareOriginalLocalVariables(il, orig);
             var copier = new MethodCopier(orig, il, originalVariables);
-            var emitter = new Emitter(il, false);
+            var emitter = new Emitter(il);
 
             copier.AddTranspiler(transpiler ?? IdentityTranspiler);
 
             var endLabels = new List<Label>();
-            _ = copier.Finalize(emitter, endLabels, out var hasReturnCode, out _);
+            var codeInstructions = copier.Finalize(false, out var hasReturnCode, out _, endLabels);
+
+			// MethodCopier had pass6 - mark labels and exceptions and emit codes.
+            // It's now gone. Probably moved over to MethodCreator?
+            // For now, I've copied it over (the whole codeInstruction.Do() block).
+            // Source: https://github.com/pardeike/Harmony/blob/01260286feaff93363f51a3b364204de343d4ad1/Harmony/Internal/MethodCopier.cs#L396-L457
+			codeInstructions.Do(codeInstruction =>
+			{
+				// mark all labels
+				codeInstruction.labels.Do(label => emitter.MarkLabel(label));
+
+				// start all exception blocks
+				// TODO: we ignore the resulting label because we have no way to use it
+				//
+				codeInstruction.blocks.Do(block =>
+				{
+					emitter.MarkBlockBefore(block, out var label);
+				});
+
+				var code = codeInstruction.opcode;
+				var operand = codeInstruction.operand;
+
+				// replace RET with a jump to the end (outside this code)
+				if (code == System.Reflection.Emit.OpCodes.Ret)
+				{
+					var endLabel = il.DefineLabel();
+					code = System.Reflection.Emit.OpCodes.Br;
+					operand = endLabel;
+					endLabels.Add(endLabel);
+				}
+
+				// replace short jumps with long ones (can be optimized but requires byte counting, not instruction counting)
+				if (MethodCreatorTools.shortJumps.TryGetValue(code, out var longJump))
+					code = longJump;
+
+				switch (code.OperandType)
+				{
+					case System.Reflection.Emit.OperandType.InlineNone:
+						emitter.Emit(code);
+						break;
+
+					case System.Reflection.Emit.OperandType.InlineSig:
+						var cecilGenerator = il.GetProxiedShim<CecilILGenerator>();
+						if (cecilGenerator is null)
+						{
+							// Right now InlineSignatures can only be emitted using MonoMod and its CecilILGenerator.
+							// That is because DynamicMethod's original ILGenerator is very restrictive about the calli opcode.
+							throw new NotSupportedException();
+						}
+						if (operand is null) throw new Exception($"Wrong null argument: {codeInstruction}");
+						if ((operand is ICallSiteGenerator) is false) throw new Exception($"Wrong Emit argument type {operand.GetType()} in {codeInstruction}");
+						emitter.AddInstruction(code, operand);
+                        FileLog.LogIL(il.ILOffset, code, operand);
+						cecilGenerator.Emit(code, (ICallSiteGenerator)operand);
+						break;
+
+					default:
+						if (operand is null) throw new Exception($"Wrong null argument: {codeInstruction}");
+						emitter.AddInstruction(code, operand);
+                        FileLog.LogIL(il.ILOffset, code, operand);
+						_ = il.DynEmit(code, operand);
+						break;
+				}
+
+				codeInstruction.blocks.Do(block => emitter.MarkBlockAfter(block));
+			});
 
             foreach (var label in endLabels)
                 emitter.MarkLabel(label);
