@@ -77,8 +77,9 @@ namespace TranspilerExplorer
         {
             var patch = MethodPatcherTools.CreateDynamicMethod(orig, DummyMethod, false);
             var il = patch.GetILGenerator();
-            var originalVariables = MethodPatcherTools.DeclareOriginalLocalVariables(il, orig);
-            var copier = new MethodCopier(orig, il, originalVariables);
+            var methodBody = MethodBodyPatching.GetMethodBody(orig);
+            var originalVariables = MethodPatcherTools.DeclareOriginalLocalVariables(il, methodBody);
+            var copier = new MethodCopier(orig, il, originalVariables, methodBody);
             var emitter = new Emitter(il);
 
             copier.AddTranspiler(transpiler ?? IdentityTranspiler);
