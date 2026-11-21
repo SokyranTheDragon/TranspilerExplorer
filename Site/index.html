@@ -1,34 +1,94 @@
-<html>
+<!doctype html>
+<html lang="en">
     <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Transpiler Explorer</title>
-        <link rel="stylesheet" href="prism.css"/>
-        <link rel="stylesheet" href="style.css"/>
+        <link rel="stylesheet" href="prism.css">
+        <link rel="stylesheet" href="style.css">
+        <!-- Classic scripts: they define the Prism and Diff globals the modules use -->
         <script src="prism.js"></script>
-		<script src="diff.js"></script>
-        <script src="script.js"></script>
+        <script src="diff.js"></script>
+        <script type="module" src="main.js"></script>
     </head>
     <body class="match-braces">
-        <div class="selector">
-            <input type="text" id="tr-search" placeholder="Filter">
-            <select name="trs" id="tr-select"></select>
-        </div>
-        <div class="main">
-            <pre><code id="code-label" class="language-csharp"></code></pre>
-            <div class="buttons">
-                <button class="lang-button" type="button">C#</button>
-                <button class="lang-button" type="button">IL</button>
-            </div>
-            <p id="il-diff-note" style="display: none;">Note: IL diffing ignores labels. The diff might not be accurate.</p>
-            <div class="tabs">
-                <div id="code1" class="code-tab" data-code-type="original">
-                    <p>Original:</p>
-                    <pre id="code1pre" class="line-numbers"><code class="language-csharp"></code></pre>
-                </div>
-                <div id="code2" class="code-tab" data-code-type="transpiled">
-                    <p>Transpiled:</p>
-                    <pre id="code2pre" class="line-numbers"><code class="language-csharp"></code></pre>
-                </div>
-            </div>
+        <header class="topbar">
+            <h1>Transpiler Explorer</h1>
+            <nav class="tabs" role="tablist">
+                <button type="button" role="tab" class="tab" data-tab="patches">Patches</button>
+                <button type="button" role="tab" class="tab" data-tab="lookup">Method lookup</button>
+            </nav>
+            <span id="status" class="pill" data-status="connecting">Connecting…</span>
+        </header>
+
+        <div class="layout">
+            <aside class="sidebar">
+                <input type="search" id="search" placeholder="Search methods, patches, owners" autocomplete="off" spellcheck="false">
+                <div id="filters" class="filters"></div>
+                <div id="list-summary" class="list-summary"></div>
+                <div id="list" class="list" role="listbox" tabindex="0" aria-label="Patched methods"></div>
+            </aside>
+
+            <main class="content">
+                <section id="tab-patches" class="tab-panel" role="tabpanel">
+                    <div id="notice" class="notice" role="status" hidden></div>
+                    <div id="method-header" class="method-header">
+                        <p class="muted">Select a patched method on the left.</p>
+                    </div>
+                    <!-- Patch checklist and baseline switch (codeview.js) -->
+                    <div id="patch-panel" class="patch-panel"></div>
+                    <div class="toolbar">
+                        <div class="segmented" role="group" aria-label="Language">
+                            <button type="button" class="lang-button" data-lang="cs">C#</button>
+                            <button type="button" class="lang-button" data-lang="il">IL</button>
+                        </div>
+                        <button type="button" id="reload" class="small" title="Rebuild both sides, re-running the transpilers (R)" disabled>Reload code <kbd>R</kbd></button>
+                        <span id="code-status" class="muted"></span>
+                        <span id="il-diff-note" class="muted" hidden>IL diffing ignores labels, so the diff might not be exact.</span>
+                    </div>
+                    <div id="warnings" class="warnings"></div>
+                    <div class="panes">
+                        <div id="code1" class="code-pane">
+                            <p class="pane-title" id="code1title">Original</p>
+                            <pre id="code1pre" class="line-numbers"><code class="language-csharp"></code></pre>
+                        </div>
+                        <div id="code2" class="code-pane">
+                            <p class="pane-title" id="code2title">Patched</p>
+                            <pre id="code2pre" class="line-numbers"><code class="language-csharp"></code></pre>
+                        </div>
+                    </div>
+                </section>
+
+                <section id="tab-lookup" class="tab-panel" role="tabpanel" hidden>
+                    <div id="lookup-notice" class="notice" role="status" hidden></div>
+                    <!-- Search box with type/method suggestions, the type browser and the single code pane (lookup.js) -->
+                    <div class="lookup-search">
+                        <input type="search" id="lookup-input" placeholder="Type or method: Verse.Pawn, Verse.Pawn:Tick, Pawn.Tick, RimWorld.X:Y(int, string)" autocomplete="off" spellcheck="false" aria-label="Look up a type or method">
+                        <div id="lookup-suggest" class="suggest" role="listbox" hidden></div>
+                    </div>
+                    <details id="lookup-browser" class="browser" hidden>
+                        <summary id="browser-summary"></summary>
+                        <input type="search" id="browser-filter" class="facet-filter" placeholder="Filter methods (also matches nested types like <GetGizmos>d__)" autocomplete="off" spellcheck="false">
+                        <div id="browser-list" class="browser-list" role="listbox"></div>
+                    </details>
+                    <div id="lookup-header" class="method-header"></div>
+                    <div class="toolbar">
+                        <div id="lookup-sources" class="segmented" role="group" aria-label="Code source"></div>
+                        <div class="segmented" role="group" aria-label="Language">
+                            <button type="button" class="lang-button" data-lang="cs">C#</button>
+                            <button type="button" class="lang-button" data-lang="il">IL</button>
+                        </div>
+                        <button type="button" id="lookup-reload" class="small" title="Rebuild the method, re-running its transpilers (R)" disabled>Reload code <kbd>R</kbd></button>
+                        <span id="lookup-status" class="muted"></span>
+                    </div>
+                    <div id="lookup-warnings" class="warnings"></div>
+                    <div class="panes">
+                        <div class="single-pane">
+                            <pre id="lookup-pre" class="line-numbers language-csharp"><code class="language-csharp"></code></pre>
+                        </div>
+                    </div>
+                </section>
+            </main>
         </div>
     </body>
 </html>
