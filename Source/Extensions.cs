@@ -1,10 +1,9 @@
 using Newtonsoft.Json.Linq;
 using System;
-using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text;
-using System.Threading.Tasks;
 
 namespace TranspilerExplorer
 {
@@ -16,18 +15,27 @@ namespace TranspilerExplorer
             resp.OutputStream.Write(data, 0, data.Length);
         }
 
-        public static void WriteJson(this HttpListenerResponse resp, JObject obj)
+        public static void WriteJson(this HttpListenerResponse resp, JToken obj)
         {
-            var data = Encoding.UTF8.GetBytes(obj.ToString());
-            resp.ContentType = "application/json";
+            resp.ContentType = "application/json; charset=utf-8";
             resp.ContentEncoding = Encoding.UTF8;
-            resp.ContentLength64 = data.LongLength;
-            resp.OutputStream.Write(data, 0, data.Length);
+            resp.WriteBytes(Encoding.UTF8.GetBytes(obj.ToString(Newtonsoft.Json.Formatting.None)));
+        }
+
+        // POST bodies are JSON objects. An empty body reads as {}.
+        public static JObject ReadJson(this HttpListenerRequest req)
+        {
+            if (!req.HasEntityBody)
+                return new JObject();
+
+            using var reader = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8);
+            var text = reader.ReadToEnd();
+            return string.IsNullOrWhiteSpace(text) ? new JObject() : JObject.Parse(text);
         }
 
         public static string PathPart(this Uri url, int index)
         {
-            return url.AbsolutePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries).ElementAtOrDefault(index);
+            return url.AbsolutePath.Split(['/'], StringSplitOptions.RemoveEmptyEntries).ElementAtOrDefault(index);
         }
     }
 }

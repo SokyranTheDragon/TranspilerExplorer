@@ -1,10 +1,5 @@
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Reflection;
-using System.Reflection.Emit;
 using System.Threading;
 using HarmonyLib;
 using UnityEngine;
@@ -16,11 +11,11 @@ namespace TranspilerExplorer
     [HotSwappable]
     static class TranspilerExplorer
     {
-        static Server server;
+        private static Server server;
 
         static TranspilerExplorer()
         {
-            TranspilerExplorerMod.harmony.PatchAll();
+            TranspilerExplorerMod.harmony.PatchAll(typeof(TranspilerExplorer).Assembly);
 
             server = new Server(
                 TranspilerExplorerMod.settings.port,
@@ -46,7 +41,7 @@ namespace TranspilerExplorer
         {
             harmony.Patch(
                 AccessTools.Method("HarmonyLib.PatchFunctions:UpdateWrapper"),
-                finalizer: new HarmonyMethod(AccessTools.Method(typeof(HarmonyPatch_UpdateWrapper_Patch), "Finalizer"))
+                finalizer: new HarmonyMethod(AccessTools.Method(typeof(PatchFailures), "Finalizer"))
             );
         }
 
@@ -71,7 +66,7 @@ namespace TranspilerExplorer
 
     public class Settings : ModSettings
     {
-        const int DEFAULT_PORT = 8339;
+        private const int DEFAULT_PORT = 8339;
         public int port = DEFAULT_PORT;
 
         public override void ExposeData()

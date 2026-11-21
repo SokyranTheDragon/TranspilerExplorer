@@ -19,13 +19,13 @@
 
     <!-- Nuget dependencies -->
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" ExcludeAssets="runtime" />
-    <PackageReference Include="ICSharpCode.Decompiler" Version="7.1.0.6543" ExcludeAssets="runtime" />
+    <PackageReference Include="ICSharpCode.Decompiler" Version="9.1.0.7988" ExcludeAssets="runtime" />
     <PackageReference Include="Krafs.Publicizer" Version="2.3.*">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-    <PackageReference Include="Lib.Harmony" Version="3.0.0-rc.6" ExcludeAssets="runtime" />
-    <PackageReference Include="Krafs.Rimworld.Ref" Version="1.7.5011-unstable" />
+    <PackageReference Include="Lib.Harmony" Version="3.0.0-rc.7" ExcludeAssets="runtime" />
+    <PackageReference Include="Krafs.Rimworld.Ref" Version="1.7.5014-unstable" />
 
   </ItemGroup>
 

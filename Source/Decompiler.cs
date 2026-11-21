@@ -1,4 +1,3 @@
-using HarmonyLib;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.DebugInfo;
@@ -13,11 +12,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
 using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using System.Threading;
-using MonoMod.Utils.Cil;
 using UnityEngine;
 
 namespace TranspilerExplorer
@@ -25,27 +22,36 @@ namespace TranspilerExplorer
     [HotSwappable]
     public static class Decompiler
     {
-        const string DummyType = "TranspilerExplorer";
-        const string DummyMethod = "Method";
-        const string DummyDll = "decomp.dll";
+        private const string DummyType = "TranspilerExplorer";
+        internal const string DummyMethod = "Method";
+        private const string DummyDll = "decomp.dll";
 
-        public static string Decompile(MethodBase orig, MethodInfo transpiler, Action<DecompilerSettingsWrapper> postProcess, IDebugInfoProvider debugInfo)
+        // Readable C#: local names come from the unpatched build of the same method, with Harmony's own locals named on top
+        // (see VariableNames), so both sides of a diff use the same names.
+        public static string Decompile(BuiltMethod built)
         {
-            using var stream = new MemoryStream();
-            WriteAssembly(stream, orig, transpiler);
-            stream.Position = 0;
+            // The decompiler changes similar looking variable names which end in a number.
+            // The appended string prevents that. It's stripped after decompilation finishes.
+            const string appended = "_0___1_";
+            var names = VariableNames.For(built).ToDictionary(kv => kv.Key, kv => kv.Value + appended);
 
-            using var peFile = new PEFile(DummyDll, stream);
-            using var writer = new StringWriter();
+            return Decompile(built, null, new VariableNameProvider(names)).Replace(appended, "");
+        }
 
-            var assemblyResolver = new UniversalAssemblyResolver(DataPath("Assembly-CSharp.dll"), false, peFile.DetectTargetFrameworkId(), peFile.DetectRuntimePack(), PEStreamOptions.Default, System.Reflection.Metadata.MetadataReaderOptions.Default);
+        // The dummy type holds the main method as `Method` plus every structured infix helper as InfixHelper0..N, with the
+        // main body's calls pointed at them. built.helperCalls is the helper each call targets, in body order: the Cecil
+        // references to those calls carry no name or declaring type, so they can only be matched by position.
+        public static string Decompile(BuiltMethod built, Action<DecompilerSettingsWrapper> postProcess, IDebugInfoProvider debugInfo)
+        {
+            using var peFile = Load(built);
+
             var settings = new DecompilerSettingsWrapper()
             {
                 ThrowOnAssemblyResolveErrors = false,
                 AnonymousMethods = false,
                 UseDebugSymbols = debugInfo != null
             };
-            var decompiler = new CSharpDecompiler(peFile, assemblyResolver, settings)
+            var decompiler = new CSharpDecompiler(peFile, Resolver(peFile, DataPath("Assembly-CSharp.dll"), PEStreamOptions.Default), settings)
             {
                 DebugInfoProvider = debugInfo,
             };
@@ -56,107 +62,41 @@ namespace TranspilerExplorer
             return code;
         }
 
-        public static string Disasm(MethodBase orig, MethodInfo transpiler)
+        public static string Disasm(BuiltMethod built)
         {
-            using var stream = new MemoryStream();
-            WriteAssembly(stream, orig, transpiler);
-            stream.Position = 0;
+            using var peFile = Load(built);
+            return Disassemble(rd =>
+            {
+                rd.DetectControlStructure = false;
+                rd.DisassembleType(peFile, peFile.GetTypeDefinition(new TopLevelTypeName(DummyType)));
+            });
+        }
 
-            using var peFile = new PEFile(DummyDll, stream);
+        internal static string Disassemble(Action<ReflectionDisassembler> disassemble)
+        {
             using var writer = new StringWriter();
-
-            var output = new PlainTextOutput(writer);
-            ReflectionDisassembler rd = new ReflectionDisassembler(output, CancellationToken.None);
-            rd.DetectControlStructure = false;
-            rd.DisassembleType(peFile, peFile.GetTypeDefinition(new TopLevelTypeName(DummyType)));
-
+            disassemble(new ReflectionDisassembler(new PlainTextOutput(writer), CancellationToken.None));
             return writer.ToString();
         }
 
-        static void WriteAssembly(Stream stream, MethodBase orig, MethodInfo transpiler)
+        internal static UniversalAssemblyResolver Resolver(MetadataFile pe, string mainPath, PEStreamOptions options)
+            => new(mainPath, false, pe.DetectTargetFrameworkId(), pe.DetectRuntimePack(), options);
+
+        // The dummy assembly, read back from memory
+        private static PEFile Load(BuiltMethod built)
         {
-            var patch = MethodPatcherTools.CreateDynamicMethod(orig, DummyMethod, false);
-            var il = patch.GetILGenerator();
-            var methodBody = MethodBodyPatching.GetMethodBody(orig);
-            var originalVariables = MethodPatcherTools.DeclareOriginalLocalVariables(il, methodBody);
-            var copier = new MethodCopier(orig, il, originalVariables, methodBody);
-            var emitter = new Emitter(il);
+            var stream = new MemoryStream();
+            WriteAssembly(stream, built);
+            stream.Position = 0;
+            return new PEFile(DummyDll, stream);
+        }
 
-            copier.AddTranspiler(transpiler ?? IdentityTranspiler);
-
-            var endLabels = new List<Label>();
-            var codeInstructions = copier.Finalize(false, out var hasReturnCode, out _, endLabels);
-
-			// MethodCopier had pass6 - mark labels and exceptions and emit codes.
-            // It's now gone. Probably moved over to MethodCreator?
-            // For now, I've copied it over (the whole codeInstruction.Do() block).
-            // Source: https://github.com/pardeike/Harmony/blob/01260286feaff93363f51a3b364204de343d4ad1/Harmony/Internal/MethodCopier.cs#L396-L457
-			codeInstructions.Do(codeInstruction =>
-			{
-				// mark all labels
-				codeInstruction.labels.Do(label => emitter.MarkLabel(label));
-
-				// start all exception blocks
-				// TODO: we ignore the resulting label because we have no way to use it
-				//
-				codeInstruction.blocks.Do(block =>
-				{
-					emitter.MarkBlockBefore(block, out var label);
-				});
-
-				var code = codeInstruction.opcode;
-				var operand = codeInstruction.operand;
-
-				// replace RET with a jump to the end (outside this code)
-				if (code == System.Reflection.Emit.OpCodes.Ret)
-				{
-					var endLabel = il.DefineLabel();
-					code = System.Reflection.Emit.OpCodes.Br;
-					operand = endLabel;
-					endLabels.Add(endLabel);
-				}
-
-				// replace short jumps with long ones (can be optimized but requires byte counting, not instruction counting)
-				if (MethodCreatorTools.shortJumps.TryGetValue(code, out var longJump))
-					code = longJump;
-
-				switch (code.OperandType)
-				{
-					case System.Reflection.Emit.OperandType.InlineNone:
-						emitter.Emit(code);
-						break;
-
-					case System.Reflection.Emit.OperandType.InlineSig:
-						var cecilGenerator = il.GetProxiedShim<CecilILGenerator>();
-						if (cecilGenerator is null)
-						{
-							// Right now InlineSignatures can only be emitted using MonoMod and its CecilILGenerator.
-							// That is because DynamicMethod's original ILGenerator is very restrictive about the calli opcode.
-							throw new NotSupportedException();
-						}
-						if (operand is null) throw new Exception($"Wrong null argument: {codeInstruction}");
-						if ((operand is ICallSiteGenerator) is false) throw new Exception($"Wrong Emit argument type {operand.GetType()} in {codeInstruction}");
-						emitter.AddInstruction(code, operand);
-                        FileLog.LogIL(il.ILOffset, code, operand);
-						cecilGenerator.Emit(code, (ICallSiteGenerator)operand);
-						break;
-
-					default:
-						if (operand is null) throw new Exception($"Wrong null argument: {codeInstruction}");
-						emitter.AddInstruction(code, operand);
-                        FileLog.LogIL(il.ILOffset, code, operand);
-						_ = il.DynEmit(code, operand);
-						break;
-				}
-
-				codeInstruction.blocks.Do(block => emitter.MarkBlockAfter(block));
-			});
-
-            foreach (var label in endLabels)
-                emitter.MarkLabel(label);
-
-            if (hasReturnCode)
-                emitter.Emit(System.Reflection.Emit.OpCodes.Ret);
+        // Writes an already-built method (e.g. captured from Harmony's MethodCreator) into the dummy assembly
+        private static void WriteAssembly(Stream stream, BuiltMethod built)
+        {
+            var patch = built.dmd ?? throw new InvalidOperationException(built.error ?? "The method wasn't built");
+            var helpers = built.helpers;
+            var helperCalls = built.helperCalls;
 
             string name = patch.GetDumpName("Cecil");
             var module = ModuleDefinition.CreateModule(name, new ModuleParameters()
@@ -176,13 +116,36 @@ namespace TranspilerExplorer
 
             module.Types.Add(typeDef);
 
-            GenerateCecilMethod(patch, typeDef);
+            // Helpers only wrap one call site each and don't call other helpers, so only the main body needs resolving
+            var helperDefs = new List<(MethodInfo generated, MethodDefinition def)>();
+            for (var i = 0; i < helpers.Count; i++)
+                helperDefs.Add((helpers[i].generated, GenerateCecilMethod(helpers[i].dmd, typeDef, $"InfixHelper{i}", null)));
+
+            // GenerateCecilMethod walks the body in order, so the n-th unresolved call is the n-th entry of helperCalls
+            var nextCall = 0;
+            MethodReference ResolveMainCall(MethodReference reference)
+            {
+                if (reference.DeclaringType != null || nextCall >= helperCalls.Count)
+                    return null;
+
+                var target = helperCalls[nextCall++];
+                foreach (var (generated, def) in helperDefs)
+                    if (generated == target)
+                        return def;
+                return null;
+            }
+
+            var main = GenerateCecilMethod(patch, typeDef, DummyMethod, ResolveMainCall);
+
+            // The main method goes first, so it's always MethodDef row 1 (VariableNameProvider names only that one)
+            typeDef.Methods.Remove(main);
+            typeDef.Methods.Insert(0, main);
 
             module.Write(stream);
         }
 
         // Copied from MonoMod.Utils.DMDCecilGenerator, edited to not load the assembly
-        static void GenerateCecilMethod(DynamicMethodDefinition dmd, TypeDefinition typeDef)
+        private static MethodDefinition GenerateCecilMethod(DynamicMethodDefinition dmd, TypeDefinition typeDef, string name, Func<MethodReference, MethodReference> resolveHelper)
         {
             var def = dmd.Definition;
             var module = typeDef.Module;
@@ -191,7 +154,8 @@ namespace TranspilerExplorer
                 return module.ImportReference(mtp);
             };
 
-            MethodDefinition clone = new MethodDefinition(dmd.Name ?? "_" + def.Name.Replace('.', '_'), def.Attributes, module.TypeSystem.Void)
+            // Always use the same name, so methods built by different pipelines (and Harmony's _PatchN suffixes) diff cleanly
+            MethodDefinition clone = new MethodDefinition(name, def.Attributes, module.TypeSystem.Void)
             {
                 MethodReturnType = def.MethodReturnType,
                 Attributes = Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.HideBySig | Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static,
@@ -212,7 +176,7 @@ namespace TranspilerExplorer
             foreach (VariableDefinition var in clone.Body.Variables)
                 var.VariableType = var.VariableType.Relink(relinker, clone);
 
-            foreach (Mono.Cecil.Cil.ExceptionHandler handler in clone.Body.ExceptionHandlers)
+            foreach (var handler in clone.Body.ExceptionHandlers)
                 if (handler.CatchType != null)
                     handler.CatchType = handler.CatchType.Relink(relinker, clone);
 
@@ -223,6 +187,10 @@ namespace TranspilerExplorer
 
                 if (operand is ParameterDefinition param)
                     operand = clone.Parameters.ElementAt(param.Index);
+                else if (operand is MethodReference mr && resolveHelper?.Invoke(mr) is { } helper)
+                    operand = helper;
+                else if (operand is MethodReference { DeclaringType: null } unresolved)
+                    throw new NotSupportedException($"Call to a generated method without a declaring type ('{unresolved.Name}') that doesn't match a captured infix helper call.");
                 else if (operand is IMetadataTokenProvider mtp)
                     operand = mtp.Relink(relinker, clone);
 
@@ -238,28 +206,19 @@ namespace TranspilerExplorer
                     type = new Mono.Cecil.ByReferenceType(type);
                 clone.Parameters.Insert(0, new ParameterDefinition("<>_this", Mono.Cecil.ParameterAttributes.None, type.Relink(relinker, clone)));
             }
+
+            return clone;
         }
 
-        public static MethodInfo IdentityTranspiler = AccessTools.Method(typeof(Decompiler), nameof(Transpiler));
-
-        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
-        {
-            return insts;
-        }
-
-        static string ManagedFolderOS()
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-                return "Resources/Data/Managed";
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                return "Managed";
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                return "Managed";
-            return null;
-        }
+        private static string ManagedFolderOS() => RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "Resources/Data/Managed" : "Managed";
 
         public static string DataPath(string file)
         {
+            // RimWorld 1.7+ runs on CoreCLR with every assembly next to the executable
+            var root = Path.Combine(AppContext.BaseDirectory, file);
+            if (File.Exists(root))
+                return root;
+
             return Path.Combine(Application.dataPath, ManagedFolderOS(), file);
         }
     }
