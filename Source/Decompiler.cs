@@ -43,7 +43,7 @@ namespace TranspilerExplorer
         // references to those calls carry no name or declaring type, so they can only be matched by position.
         public static string Decompile(BuiltMethod built, Action<DecompilerSettingsWrapper> postProcess, IDebugInfoProvider debugInfo)
         {
-            using var peFile = Load(built);
+            using var peFile = Load(built, forCSharp: true);
 
             var settings = new DecompilerSettingsWrapper()
             {
@@ -64,7 +64,7 @@ namespace TranspilerExplorer
 
         public static string Disasm(BuiltMethod built)
         {
-            using var peFile = Load(built);
+            using var peFile = Load(built, forCSharp: false);
             return Disassemble(rd =>
             {
                 rd.DetectControlStructure = false;
@@ -83,16 +83,17 @@ namespace TranspilerExplorer
             => new(mainPath, false, pe.DetectTargetFrameworkId(), pe.DetectRuntimePack(), options);
 
         // The dummy assembly, read back from memory
-        private static PEFile Load(BuiltMethod built)
+        private static PEFile Load(BuiltMethod built, bool forCSharp)
         {
             var stream = new MemoryStream();
-            WriteAssembly(stream, built);
+            WriteAssembly(stream, built, forCSharp);
             stream.Position = 0;
             return new PEFile(DummyDll, stream);
         }
 
-        // Writes an already-built method (e.g. captured from Harmony's MethodCreator) into the dummy assembly
-        private static void WriteAssembly(Stream stream, BuiltMethod built)
+        // Writes an already-built method (e.g. captured from Harmony's MethodCreator) into the dummy assembly.
+        // forCSharp: rewrite IL that C# can't express into readable stand-ins (see RewriteMethodTokens). The IL view keeps the real IL.
+        private static void WriteAssembly(Stream stream, BuiltMethod built, bool forCSharp)
         {
             var patch = built.dmd ?? throw new InvalidOperationException(built.error ?? "The method wasn't built");
             var helpers = built.helpers;
@@ -141,7 +142,78 @@ namespace TranspilerExplorer
             typeDef.Methods.Remove(main);
             typeDef.Methods.Insert(0, main);
 
+            if (forCSharp)
+            {
+                MethodReference methodOf = null;
+                foreach (var method in typeDef.Methods)
+                    RewriteMethodTokens(method, () => methodOf ??= DefineMethodOf(module));
+            }
+
             module.Write(stream);
+        }
+
+        // C# has no syntax for a method token, so ILSpy prints `/*OpCode not supported: LdMemberToken*/` for
+        //   ldtoken <method> [ldtoken <declaring type>] call MethodBase.GetMethodFromHandle(...)
+        // which is how Harmony injects __originalMethod (and how transpilers sometimes load a MethodBase). Rewrite it to
+        //   ldstr "<method>" [nop] call MethodOf.Get(string)
+        // which decompiles as MethodOf.Get("Type::Method(params)"). Instructions are changed in place, so branch targets stay valid.
+        private static void RewriteMethodTokens(MethodDefinition method, Func<MethodReference> methodOf)
+        {
+            var instrs = method.Body.Instructions;
+            for (var i = 0; i < instrs.Count; i++)
+            {
+                if (instrs[i].OpCode != OpCodes.Ldtoken || instrs[i].Operand is not MethodReference target)
+                    continue;
+
+                var callIndex = i + 1;
+                Instruction typeToken = null;
+                if (callIndex < instrs.Count && instrs[callIndex].OpCode == OpCodes.Ldtoken && instrs[callIndex].Operand is TypeReference)
+                    typeToken = instrs[callIndex++];
+
+                if (callIndex >= instrs.Count || !IsGetMethodFromHandle(instrs[callIndex], typeToken != null ? 2 : 1))
+                    continue;
+
+                instrs[i].OpCode = OpCodes.Ldstr;
+                instrs[i].Operand = Describe(target);
+                if (typeToken != null)
+                {
+                    typeToken.OpCode = OpCodes.Nop;
+                    typeToken.Operand = null;
+                }
+                instrs[callIndex].Operand = methodOf();
+                i = callIndex;
+            }
+        }
+
+        private static bool IsGetMethodFromHandle(Instruction instr, int paramCount) =>
+            instr.OpCode == OpCodes.Call
+            && instr.Operand is MethodReference { Name: nameof(MethodBase.GetMethodFromHandle) } call
+            && call.DeclaringType?.FullName == typeof(MethodBase).FullName
+            && call.Parameters.Count == paramCount;
+
+        private static string Describe(MethodReference method) =>
+            $"{method.DeclaringType?.FullName}::{method.Name}({string.Join(", ", method.Parameters.Select(p => p.ParameterType.FullName))})";
+
+        // A stub `static MethodBase MethodOf.Get(string)` in its own type, so it never shows up in the decompiled dummy type
+        private static MethodReference DefineMethodOf(ModuleDefinition module)
+        {
+            var type = new TypeDefinition("", "MethodOf",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed | Mono.Cecil.TypeAttributes.Class)
+            {
+                BaseType = module.TypeSystem.Object
+            };
+            module.Types.Add(type);
+
+            var get = new MethodDefinition("Get",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static | Mono.Cecil.MethodAttributes.HideBySig,
+                module.ImportReference(typeof(MethodBase)));
+            get.Parameters.Add(new ParameterDefinition("method", Mono.Cecil.ParameterAttributes.None, module.TypeSystem.String));
+            var il = get.Body.GetILProcessor();
+            il.Emit(OpCodes.Ldnull);
+            il.Emit(OpCodes.Ret);
+            type.Methods.Add(get);
+
+            return get;
         }
 
         // Copied from MonoMod.Utils.DMDCecilGenerator, edited to not load the assembly
