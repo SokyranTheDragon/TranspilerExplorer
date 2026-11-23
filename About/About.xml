@@ -19,8 +19,10 @@
     </li>
   </modDependencies>
   <loadAfter>
-    <li>Ludeon.RimWorld</li>
-    <li>Ludeon.RimWorld.Royalty</li>
     <li>brrainz.harmony</li>
   </loadAfter>
+  <!-- As early as possible: patch failures are only recorded for mods whose Mod constructor runs after ours -->
+  <loadBefore>
+    <li>Ludeon.RimWorld</li>
+  </loadBefore>
 </ModMetaData>
