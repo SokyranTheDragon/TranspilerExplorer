@@ -34,6 +34,7 @@ namespace TranspilerExplorer
         [ThreadStatic] internal static bool capturing;
         [ThreadStatic] internal static List<(DynamicMethodDefinition dmd, MethodInfo generated)> capturedHelpers;
         [ThreadStatic] internal static List<MethodInfo> capturedHelperCalls;
+        [ThreadStatic] internal static List<string> captureWarnings;
 
         public static BuiltMethod Build(MethodBase original, IEnumerable<CatalogPatch> selected)
         {
@@ -69,6 +70,7 @@ namespace TranspilerExplorer
             capturing = true;
             capturedHelpers = built.helpers;
             capturedHelperCalls = null;
+            captureWarnings = built.warnings;
             try
             {
                 creator.CreateReplacement();
@@ -85,6 +87,7 @@ namespace TranspilerExplorer
                 capturing = false;
                 capturedHelpers = null;
                 capturedHelperCalls = null;
+                captureWarnings = null;
             }
 
             try
@@ -137,6 +140,56 @@ namespace TranspilerExplorer
         }
 
         private static string Identifier(string s) => new string(s.Select(ch => char.IsLetterOrDigit(ch) || ch == '_' ? ch : '_').ToArray());
+    }
+
+    // Stands in for an instruction Harmony can't emit, so the rest of the method can still be shown.
+    // Decompiles as `InvalidInstruction.Here("callvirt NULL")`.
+    public static class InvalidInstruction
+    {
+        public static void Here(string instruction) { }
+    }
+
+    // Harmony throws on an instruction with a missing or wrong-kind operand (a transpiler's `callvirt NULL`, say), which
+    // would lose the whole method. While capturing, swap each such instruction for `ldstr "<instruction>"` +
+    // `call InvalidInstruction.Here(string)`. That has no net stack effect, so the real one's is lost, but the code around it reads fine.
+    [HarmonyPatch(typeof(MethodCreatorTools), nameof(MethodCreatorTools.EmitCodes))]
+    static class ReplaceInvalidInstructionsPatch
+    {
+        private static readonly MethodInfo Here = AccessTools.Method(typeof(InvalidInstruction), nameof(InvalidInstruction.Here));
+
+        private static void Prefix(List<CodeInstruction> codeInstructions)
+        {
+            if (!MethodBuilder.capturing || codeInstructions == null)
+                return;
+
+            for (var i = 0; i < codeInstructions.Count; i++)
+            {
+                var ci = codeInstructions[i];
+                if (!IsInvalid(ci))
+                    continue;
+
+                var text = ci.ToString();
+                MethodBuilder.captureWarnings?.Add($"Invalid instruction `{text}` (a transpiler emitted it with a missing or wrong operand). Harmony would fail to patch this method; it's shown as InvalidInstruction.Here(\"{text}\").");
+
+                // Labels and the exception blocks Harmony begins before an instruction go on the first one, the blocks it ends after it on the last one
+                var load = new CodeInstruction(OpCodes.Ldstr, text) { labels = ci.labels };
+                var call = new CodeInstruction(OpCodes.Call, Here);
+                foreach (var block in ci.blocks)
+                    (block.blockType == ExceptionBlockType.EndExceptionBlock ? call : load).blocks.Add(block);
+
+                codeInstructions[i] = load;
+                codeInstructions.Insert(++i, call);
+            }
+        }
+
+        // Mirrors the checks in MethodCreatorTools.EmitCodes
+        private static bool IsInvalid(CodeInstruction ci) =>
+            ci.opcode.OperandType switch
+            {
+                OperandType.InlineNone => false,
+                OperandType.InlineSig => ci.operand is not ICallSiteGenerator,
+                _ => ci.operand == null
+            };
     }
 
     [HarmonyPatch(typeof(MethodCreatorConfig), nameof(MethodCreatorConfig.GenerateMethod))]
